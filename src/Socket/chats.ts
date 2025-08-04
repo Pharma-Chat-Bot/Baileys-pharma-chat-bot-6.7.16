@@ -7,7 +7,7 @@ import { LabelActionBody } from '../Types/Label'
 import { chatModificationToAppPatch, ChatMutationMap, decodePatches, decodeSyncdSnapshot, encodeSyncdPatch, extractSyncdPatches, generateProfilePicture, getHistoryMsg, newLTHashState, processSyncAction } from '../Utils'
 import { makeMutex } from '../Utils/make-mutex'
 import processMessage from '../Utils/process-message'
-import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, jidNormalizedUser, reduceBinaryNodeToDictionary, S_WHATSAPP_NET } from '../WABinary'
+import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, jidNormalizedUser, reduceBinaryNodeToDictionary, S_WHATSAPP_NET, isLidUser, jidDecode } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeUSyncSocket } from './usync'
 
@@ -530,22 +530,29 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	 * type = "preview" for a low res picture
 	 * type = "image for the high res picture"
 	 */
-	const profilePictureUrl = async(jid: string, type: 'preview' | 'image' = 'preview', timeoutMs?: number) => {
-		jid = jidNormalizedUser(jid)
-		const result = await query({
-			tag: 'iq',
-			attrs: {
-				target: jid,
-				to: S_WHATSAPP_NET,
-				type: 'get',
-				xmlns: 'w:profile:picture'
-			},
-			content: [
-				{ tag: 'picture', attrs: { type, query: 'url' } }
-			]
-		}, timeoutMs)
-		const child = getBinaryNodeChild(result, 'picture')
-		return child?.attrs?.url
+	const profilePictureUrl = async (jid: string, type: 'preview' | 'image' = 'preview', timeoutMs?: number) => {
+		try {
+			jid = jidNormalizedUser(jid)
+			const result = await query(
+				{
+					tag: 'iq',
+					attrs: {
+						target: jid,
+						to: S_WHATSAPP_NET,
+						type: 'get',
+						xmlns: 'w:profile:picture'
+					},
+					content: [{ tag: 'picture', attrs: { type, query: 'url' } }]
+				},
+				timeoutMs
+			)
+			const child = getBinaryNodeChild(result, 'picture')
+			return child?.attrs?.url
+		} catch (error) {
+			// Return undefined instead of throwing error for profile picture requests
+			// This is the fix from the official Baileys repository
+			return undefined
+		}
 	}
 
 	const sendPresenceUpdate = async(type: WAPresence, toJid?: string) => {
@@ -561,16 +568,19 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			await sendNode({
 				tag: 'presence',
 				attrs: {
-					name: me.name,
+					name: me.name.replace(/@/g, ''),
 					type
 				}
 			})
 		} else {
+			const { server } = jidDecode(toJid)!
+			const isLid = server === 'lid'
+
 			await sendNode({
 				tag: 'chatstate',
 				attrs: {
-					from: me.id,
-					to: toJid!,
+					from: isLid ? me.lid! : me.id,
+					to: toJid!
 				},
 				content: [
 					{
