@@ -91,6 +91,18 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	let sendActiveReceipts = false
 
+	const handlePreKeyRecovery = async () => {
+		logger.warn('Pre-key error detected, attempting recovery')
+		
+		try {
+			// Upload new pre-keys to recover from the error
+			await uploadPreKeys()
+			logger.info('Pre-key recovery completed successfully')
+		} catch (recoveryError) {
+			logger.error({ recoveryError }, 'Pre-key recovery failed')
+		}
+	}
+
 	const sendMessageAck = async({ tag, attrs, content }: BinaryNode, errorCode?: number) => {
 		const stanza: BinaryNode = {
 			tag: 'ack',
@@ -779,6 +791,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						// message failed to decrypt
 						if(msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT) {
 						  if(msg?.messageStubParameters?.[0] === MISSING_KEYS_ERROR_TEXT) {
+								logger.warn('Pre-key error detected, attempting recovery')
+								
+								// Try to recover by uploading new pre-keys
+								try {
+									await handlePreKeyRecovery()
+									logger.info('Pre-key recovery completed')
+								} catch (recoveryError) {
+									logger.error({ recoveryError }, 'Pre-key recovery failed')
+								}
+								
 								return sendMessageAck(node, NACK_REASONS.ParsingError)
 							}
 

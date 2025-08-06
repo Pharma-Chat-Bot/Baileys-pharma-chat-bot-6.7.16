@@ -279,6 +279,102 @@ export const makeSocket = (config: SocketConfig) => {
 		return +countChild!.attrs.value
 	}
 
+	const getLocalPreKeyCount = async () => {
+		const localPreKeys = await keys.get('pre-key', [])
+		return Object.keys(localPreKeys || {}).length
+	}
+
+	const clearInvalidPreKeys = async () => {
+		try {
+			logger.info('Clearing invalid pre-keys due to count mismatch')
+			// Remove all pre-keys to force regeneration
+			await keys.set({ 'pre-key': {} })
+			logger.info('Invalid pre-keys cleared successfully')
+		} catch (error) {
+			logger.error({ error }, 'Failed to clear invalid pre-keys')
+		}
+	}
+
+	const validatePreKeys = async () => {
+		try {
+			const localPreKeys = await keys.get('pre-key', [])
+			const localCount = Object.keys(localPreKeys || {}).length
+			const serverCount = await getAvailablePreKeysOnServer()
+			
+			const isValid = localCount === serverCount && localCount >= MIN_PREKEY_COUNT
+			
+			logger.info({ 
+				localCount, 
+				serverCount, 
+				isValid, 
+				minRequired: MIN_PREKEY_COUNT 
+			}, 'Pre-keys validation result')
+			
+			return isValid
+		} catch (error) {
+			logger.error({ error }, 'Failed to validate pre-keys')
+			return false
+		}
+	}
+
+	const handlePreKeyError = async (error: any) => {
+		logger.warn({ error }, 'Pre-key error detected, attempting recovery')
+		
+		try {
+			// Clear all pre-keys and regenerate
+			await clearInvalidPreKeys()
+			await uploadPreKeys()
+			
+			logger.info('Pre-key error recovery completed')
+		} catch (recoveryError) {
+			logger.error({ recoveryError }, 'Pre-key error recovery failed')
+		}
+	}
+
+	const monitorPreKeys = async () => {
+		try {
+			const isValid = await validatePreKeys()
+			if (!isValid) {
+				logger.warn('Pre-keys validation failed, attempting proactive recovery')
+				await uploadPreKeysToServerIfRequired()
+			}
+		} catch (error) {
+			logger.error({ error }, 'Pre-keys monitoring failed')
+		}
+	}
+
+	const startPreKeyMonitoring = () => {
+		// Monitora e limpa pre-keys a cada 30 minutos
+		setInterval(async () => {
+			try {
+				await monitorPreKeys()
+			} catch (error) {
+				logger.error({ error }, 'Pre-key monitoring interval failed')
+			}
+		}, 30 * 60 * 1000) // 30 minutos
+		
+		logger.info('Pre-key monitoring started (30min intervals)')
+	}
+
+	const getPreKeysStatus = async () => {
+		try {
+			const localPreKeys = await keys.get('pre-key', [])
+			const preKeyIds = Object.keys(localPreKeys || {})
+			const serverCount = await getAvailablePreKeysOnServer()
+			
+			return {
+				localCount: preKeyIds.length,
+				serverCount,
+				localIds: preKeyIds.map(id => parseInt(id)).sort((a, b) => a - b),
+				needsCleanup: preKeyIds.length > 50,
+				needsUpload: serverCount <= MIN_PREKEY_COUNT
+			}
+		} catch (error) {
+			logger.error({ error }, 'Failed to get pre-keys status')
+			return null
+		}
+	}
+
 	/** generates and uploads a set of pre-keys to the server */
 	const uploadPreKeys = async(count = INITIAL_PREKEY_COUNT) => {
 		await keys.transaction(
@@ -295,10 +391,44 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	const uploadPreKeysToServerIfRequired = async() => {
-		const preKeyCount = await getAvailablePreKeysOnServer()
-		logger.info(`${preKeyCount} pre-keys found on server`)
-		if(preKeyCount <= MIN_PREKEY_COUNT) {
-			await uploadPreKeys()
+		try {
+			const preKeyCount = await getAvailablePreKeysOnServer()
+			const localPreKeyCount = await getLocalPreKeyCount()
+			
+			logger.info(`${preKeyCount} pre-keys found on server, ${localPreKeyCount} local pre-keys available`)
+			
+			const lowServerCount = preKeyCount <= MIN_PREKEY_COUNT
+			const countMismatch = localPreKeyCount !== preKeyCount
+			const isValid = await validatePreKeys()
+			
+			const shouldUpload = lowServerCount || countMismatch || !isValid
+			
+			if (shouldUpload) {
+				// If there's a count mismatch or invalid state, clear invalid pre-keys first
+				if (countMismatch || !isValid) {
+					await clearInvalidPreKeys()
+				}
+				
+				await uploadPreKeys()
+				
+				// Validate again after upload
+				const finalValidation = await validatePreKeys()
+				if (finalValidation) {
+					logger.info('Pre-keys successfully synchronized and validated')
+				} else {
+					logger.warn('Pre-keys upload completed but validation failed')
+				}
+			} else {
+				logger.info(`PreKey count is sufficient and matches - Server: ${preKeyCount}, Local: ${localPreKeyCount}`)
+			}
+		} catch (error) {
+			logger.error({ error }, 'Error in uploadPreKeysToServerIfRequired')
+			// Fallback: try to upload pre-keys anyway
+			try {
+				await uploadPreKeys()
+			} catch (fallbackError) {
+				logger.error({ fallbackError }, 'Fallback pre-keys upload also failed')
+			}
 		}
 	}
 
@@ -649,6 +779,9 @@ export const makeSocket = (config: SocketConfig) => {
 		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
 		console.log('🆔 [creds.update] LID emitido:', node.attrs.lid)
 
+		// Inicia monitoramento de pre-keys
+		startPreKeyMonitoring()
+
 		ev.emit('connection.update', { connection: 'open' })
 	})
 
@@ -759,6 +892,11 @@ export const makeSocket = (config: SocketConfig) => {
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
 		sendWAMBuffer,
+		monitorPreKeys,
+		validatePreKeys,
+		handlePreKeyError,
+		clearInvalidPreKeys,
+		getPreKeysStatus,
 	}
 }
 
